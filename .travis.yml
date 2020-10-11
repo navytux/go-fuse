@@ -11,7 +11,14 @@ go:
   - 1.11.x
   - 1.12.x
   - 1.13.x
+  - 1.14.x
+  - 1.15.x
   - master
+
+env:
+  - GOMAXPROCS=1
+  # vvv = native `nproc`
+  - GOMAXPROCS=
 
 matrix:
  fast_finish: true
