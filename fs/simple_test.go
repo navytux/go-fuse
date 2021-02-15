@@ -5,12 +5,19 @@
 package fs
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -390,6 +397,219 @@ func TestOpenDirectIO(t *testing.T) {
 	tc := newTestCase(t, &opts)
 	defer tc.Clean()
 	posixtest.DirectIO(t, tc.mntDir)
+}
+
+// TestFsstress is loosely modeled after xfstest's fsstress. It performs rapid
+// parallel removes / creates / readdirs. Coupled with inode reuse, this test
+// used to deadlock go-fuse quite quickly.
+//
+// Note: Run as
+//
+//     TMPDIR=/var/tmp go test -run TestFsstress
+//
+// to make sure the backing filesystem is ext4. /tmp is tmpfs on modern Linux
+// distributions, and tmpfs does not reuse inode numbers, hiding the problem.
+func TestFsstress(t *testing.T) {
+	tc := newTestCase(t, &testOptions{suppressDebug: true, attrCache: true, entryCache: true})
+	defer tc.Clean()
+
+	{
+		old := runtime.GOMAXPROCS(100)
+		defer runtime.GOMAXPROCS(old)
+	}
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// operations taking 1 path argument
+	ops1 := map[string]func(string) error{
+		"mkdir":      func(p string) error { return syscall.Mkdir(p, 0700) },
+		"rmdir":      func(p string) error { return syscall.Rmdir(p) },
+		"mknod_reg":  func(p string) error { return syscall.Mknod(p, 0700|syscall.S_IFREG, 0) },
+		"remove":     os.Remove,
+		"unlink":     syscall.Unlink,
+		"mknod_sock": func(p string) error { return syscall.Mknod(p, 0700|syscall.S_IFSOCK, 0) },
+		"mknod_fifo": func(p string) error { return syscall.Mknod(p, 0700|syscall.S_IFIFO, 0) },
+		"mkfifo":     func(p string) error { return syscall.Mkfifo(p, 0700) },
+		"symlink":    func(p string) error { return syscall.Symlink("foo", p) },
+		"creat": func(p string) error {
+			fd, err := syscall.Open(p, syscall.O_CREAT|syscall.O_EXCL, 0700)
+			if err == nil {
+				syscall.Close(fd)
+			}
+			return err
+		},
+	}
+	// operations taking 2 path arguments
+	ops2 := map[string]func(string, string) error{
+		"rename": syscall.Rename,
+		"link":   syscall.Link,
+	}
+
+	type opStats struct {
+		ok   *int64
+		fail *int64
+		hung *int64
+	}
+	stats := make(map[string]opStats)
+
+	// pathN() returns something like /var/tmp/TestFsstress/TestFsstress.4
+	pathN := func(n int) string {
+		return fmt.Sprintf("%s/%s.%d", tc.mntDir, t.Name(), n)
+	}
+
+	opLoop := func(k string, n int) {
+		defer wg.Done()
+		op := ops1[k]
+		for {
+			p := pathN(1)
+			atomic.AddInt64(stats[k].hung, 1)
+			err := op(p)
+			atomic.AddInt64(stats[k].hung, -1)
+			if err != nil {
+				atomic.AddInt64(stats[k].fail, 1)
+			} else {
+				atomic.AddInt64(stats[k].ok, 1)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}
+
+	op2Loop := func(k string, n int) {
+		defer wg.Done()
+		op := ops2[k]
+		n2 := (n + 1) % concurrency
+		for {
+			p1 := pathN(n)
+			p2 := pathN(n2)
+			atomic.AddInt64(stats[k].hung, 1)
+			err := op(p1, p2)
+			atomic.AddInt64(stats[k].hung, -1)
+			if err != nil {
+				atomic.AddInt64(stats[k].fail, 1)
+			} else {
+				atomic.AddInt64(stats[k].ok, 1)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}
+
+	readdirLoop := func(k string) {
+		defer wg.Done()
+		for {
+			atomic.AddInt64(stats[k].hung, 1)
+			f, err := os.Open(tc.mntDir)
+			if err != nil {
+				panic(err)
+			}
+			_, err = f.Readdir(0)
+			if err != nil {
+				atomic.AddInt64(stats[k].fail, 1)
+			} else {
+				atomic.AddInt64(stats[k].ok, 1)
+			}
+			f.Close()
+			atomic.AddInt64(stats[k].hung, -1)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}
+
+	// prepare stats map
+	var allOps []string
+	for k := range ops1 {
+		allOps = append(allOps, k)
+	}
+	for k := range ops2 {
+		allOps = append(allOps, k)
+	}
+	allOps = append(allOps, "readdir")
+	for _, k := range allOps {
+		var i1, i2, i3 int64
+		stats[k] = opStats{ok: &i1, fail: &i2, hung: &i3}
+	}
+
+	// spawn worker goroutines
+	for i := 0; i < concurrency; i++ {
+		for k := range ops1 {
+			wg.Add(1)
+			go opLoop(k, i)
+		}
+		for k := range ops2 {
+			wg.Add(1)
+			go op2Loop(k, i)
+		}
+	}
+	{
+		k := "readdir"
+		wg.Add(1)
+		go readdirLoop(k)
+	}
+
+	// spawn ls loop
+	//
+	// An external "ls" loop has a destructive effect that I am unable to
+	// reproduce through in-process operations.
+	if strings.ContainsAny(tc.mntDir, "'\\") {
+		// But let's not enable shell injection.
+		log.Panicf("shell injection attempt? mntDir=%q", tc.mntDir)
+	}
+	// --color=always enables xattr lookups for extra stress
+	cmd := exec.Command("bash", "-c", "while true ; do ls -l --color=always '"+tc.mntDir+"'; done")
+	err := cmd.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+
+	// Run the test for 1 second. If it deadlocks, it usually does within 20ms.
+	time.Sleep(1 * time.Second)
+
+	cancel()
+
+	// waitTimeout waits for the waitgroup for the specified max timeout.
+	// Returns true if waiting timed out.
+	waitTimeout := func(wg *sync.WaitGroup, timeout time.Duration) bool {
+		c := make(chan struct{})
+		go func() {
+			defer close(c)
+			wg.Wait()
+		}()
+		select {
+		case <-c:
+			return false // completed normally
+		case <-time.After(timeout):
+			return true // timed out
+		}
+	}
+
+	if waitTimeout(&wg, time.Second) {
+		t.Errorf("timeout waiting for goroutines to exit (deadlocked?)")
+	}
+
+	// Print operation statistics
+	var keys []string
+	for k := range stats {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	t.Logf("Operation statistics:")
+	for _, k := range keys {
+		v := stats[k]
+		t.Logf("%10s: %5d ok, %6d fail, %2d hung", k, *v.ok, *v.fail, *v.hung)
+	}
 }
 
 func init() {
