@@ -13,7 +13,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/internal/utimens"
 )
 
-func (f *loopbackFile) Allocate(off uint64, sz uint64, mode uint32) fuse.Status {
+func (f *loopbackFile) Allocate(off uint64, sz uint64, mode uint32, ctx *fuse.Context) fuse.Status {
 	// TODO: Handle `mode` parameter.
 
 	// From `man fcntl` on OSX:
@@ -57,6 +57,7 @@ func (f *loopbackFile) Allocate(off uint64, sz uint64, mode uint32) fuse.Status 
 	// Linux version for reference:
 	// err := syscall.Fallocate(int(f.File.Fd()), mode, int64(off), int64(sz))
 
+	// XXX cancel not propagated
 	f.lock.Lock()
 	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.File.Fd(), uintptr(syscall.F_PREALLOCATE), uintptr(unsafe.Pointer(&k)))
 	f.lock.Unlock()
@@ -80,18 +81,18 @@ func timeToTimeval(t *time.Time) syscall.Timeval {
 
 // MacOS before High Sierra lacks utimensat() and UTIME_OMIT.
 // We emulate using utimes() and extra GetAttr() calls.
-func (f *loopbackFile) Utimens(a *time.Time, m *time.Time) fuse.Status {
+func (f *loopbackFile) Utimens(a *time.Time, m *time.Time, ctx *fuse.Context) fuse.Status {
 	var attr fuse.Attr
 	if a == nil || m == nil {
 		var status fuse.Status
-		status = f.GetAttr(&attr)
+		status = f.GetAttr(&attr, ctx)
 		if !status.Ok() {
 			return status
 		}
 	}
 	tv := utimens.Fill(a, m, &attr)
 	f.lock.Lock()
-	err := syscall.Futimes(int(f.File.Fd()), tv)
+	err := syscall.Futimes(int(f.File.Fd()), tv) // XXX cancel not propagated
 	f.lock.Unlock()
 	return fuse.ToStatus(err)
 }
