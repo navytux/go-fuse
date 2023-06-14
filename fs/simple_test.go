@@ -46,21 +46,21 @@ func (tc *testCase) writeOrig(path, content string, mode os.FileMode) {
 	}
 }
 
-func (tc *testCase) Clean() {
+func (tc *testCase) clean() {
 	if err := tc.server.Unmount(); err != nil {
-		tc.Fatal(err)
-	}
-	if err := os.RemoveAll(tc.dir); err != nil {
 		tc.Fatal(err)
 	}
 }
 
 type testOptions struct {
-	entryCache    bool
-	attrCache     bool
-	suppressDebug bool
-	testDir       string
-	ro            bool
+	entryCache        bool
+	enableLocks       bool
+	attrCache         bool
+	suppressDebug     bool
+	testDir           string
+	ro                bool
+	directMount       bool // sets MountOptions.DirectMount
+	directMountStrict bool // sets MountOptions.DirectMountStrict
 }
 
 // newTestCase creates the directories `orig` and `mnt` inside a temporary
@@ -70,7 +70,7 @@ func newTestCase(t *testing.T, opts *testOptions) *testCase {
 		opts = &testOptions{}
 	}
 	if opts.testDir == "" {
-		opts.testDir = testutil.TempDir()
+		opts.testDir = t.TempDir()
 	}
 	tc := &testCase{
 		dir: opts.testDir,
@@ -107,7 +107,11 @@ func newTestCase(t *testing.T, opts *testOptions) *testCase {
 		Logger:       log.New(os.Stderr, "", 0),
 	})
 
-	mOpts := &fuse.MountOptions{}
+	mOpts := &fuse.MountOptions{
+		DirectMount:       opts.directMount,
+		DirectMountStrict: opts.directMountStrict,
+		EnableLocks:       opts.enableLocks,
+	}
 	if !opts.suppressDebug {
 		mOpts.Debug = testutil.VerboseTest()
 	}
@@ -123,12 +127,13 @@ func newTestCase(t *testing.T, opts *testOptions) *testCase {
 	if err := tc.server.WaitMount(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(tc.clean)
+
 	return tc
 }
 
 func TestBasic(t *testing.T) {
 	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
-	defer tc.Clean()
 
 	tc.writeOrig("file", "hello", 0644)
 
@@ -162,15 +167,10 @@ func TestFileFdLeak(t *testing.T) {
 		attrCache:     true,
 		entryCache:    true,
 	})
-	defer func() {
-		if tc != nil {
-			tc.Clean()
-		}
-	}()
 
 	posixtest.FdLeak(t, tc.mntDir)
 
-	tc.Clean()
+	tc.clean()
 	bridge := tc.rawFS.(*rawBridge)
 	tc = nil
 
@@ -181,7 +181,6 @@ func TestFileFdLeak(t *testing.T) {
 
 func TestNotifyEntry(t *testing.T) {
 	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
-	defer tc.Clean()
 
 	orig := tc.origDir + "/file"
 	fn := tc.mntDir + "/file"
@@ -214,7 +213,6 @@ func TestNotifyEntry(t *testing.T) {
 
 func TestReadDirStress(t *testing.T) {
 	tc := newTestCase(t, &testOptions{suppressDebug: true, attrCache: true, entryCache: true})
-	defer tc.Clean()
 
 	// Create 110 entries
 	for i := 0; i < 110; i++ {
@@ -234,12 +232,11 @@ func TestReadDirStress(t *testing.T) {
 				return
 			}
 			_, err = f.Readdirnames(-1)
+			f.Close()
 			if err != nil {
 				t.Errorf("goroutine %d iteration %d: %v", gr, i, err)
-				f.Close()
 				return
 			}
-			f.Close()
 		}
 	}
 
@@ -249,13 +246,13 @@ func TestReadDirStress(t *testing.T) {
 		go stress(i)
 	}
 	wg.Wait()
+
 }
 
 // This test is racy. If an external process consumes space while this
 // runs, we may see spurious differences between the two statfs() calls.
 func TestStatFs(t *testing.T) {
 	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
-	defer tc.Clean()
 
 	empty := syscall.Statfs_t{}
 	orig := empty
@@ -283,7 +280,6 @@ func TestGetAttrParallel(t *testing.T) {
 	// (f)stat in parallel don't lead to fstat on closed files.
 	// We can only test that if we switch off caching
 	tc := newTestCase(t, &testOptions{suppressDebug: true})
-	defer tc.Clean()
 
 	N := 100
 
@@ -324,7 +320,6 @@ func TestGetAttrParallel(t *testing.T) {
 
 func TestMknod(t *testing.T) {
 	tc := newTestCase(t, &testOptions{})
-	defer tc.Clean()
 
 	modes := map[string]uint32{
 		"regular": syscall.S_IFREG,
@@ -358,8 +353,7 @@ func TestMknod(t *testing.T) {
 }
 
 func TestMknodNotSupported(t *testing.T) {
-	mountPoint := testutil.TempDir()
-	defer os.Remove(mountPoint)
+	mountPoint := t.TempDir()
 
 	server, err := Mount(mountPoint, &Inode{}, nil)
 	if err != nil {
@@ -385,8 +379,10 @@ func TestPosix(t *testing.T) {
 		t.Run(nm, func(t *testing.T) {
 			tc := newTestCase(t, &testOptions{
 				suppressDebug: noisy[nm],
-				attrCache:     true, entryCache: true})
-			defer tc.Clean()
+				attrCache:     true,
+				entryCache:    true,
+				enableLocks:   true,
+			})
 
 			fn(t, tc.mntDir)
 		})
@@ -414,7 +410,6 @@ func TestOpenDirectIO(t *testing.T) {
 	}
 
 	tc := newTestCase(t, &opts)
-	defer tc.Clean()
 	posixtest.DirectIO(t, tc.mntDir)
 }
 
@@ -424,13 +419,12 @@ func TestOpenDirectIO(t *testing.T) {
 //
 // Note: Run as
 //
-//     TMPDIR=/var/tmp go test -run TestFsstress
+//	TMPDIR=/var/tmp go test -run TestFsstress
 //
 // to make sure the backing filesystem is ext4. /tmp is tmpfs on modern Linux
 // distributions, and tmpfs does not reuse inode numbers, hiding the problem.
 func TestFsstress(t *testing.T) {
 	tc := newTestCase(t, &testOptions{suppressDebug: true, attrCache: true, entryCache: true})
-	defer tc.Clean()
 
 	{
 		old := runtime.GOMAXPROCS(100)
@@ -591,12 +585,19 @@ func TestFsstress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wg.Add(1)
+	go func() {
+		cmd.Wait()
+		wg.Done()
+	}()
+
 	defer cmd.Process.Kill()
 
 	// Run the test for 1 second. If it deadlocks, it usually does within 20ms.
 	time.Sleep(1 * time.Second)
 
 	cancel()
+	cmd.Process.Kill()
 
 	// waitTimeout waits for the waitgroup for the specified max timeout.
 	// Returns true if waiting timed out.
@@ -643,7 +644,6 @@ func TestFsstress(t *testing.T) {
 func TestStaleHardlinks(t *testing.T) {
 	// Disable all caches we can disable
 	tc := newTestCase(t, &testOptions{attrCache: false, entryCache: false})
-	defer tc.Clean()
 
 	// "link0" is original file
 	link0 := tc.mntDir + "/link0"

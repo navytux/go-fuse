@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 )
 
 // All holds a map of all test functions
@@ -32,6 +33,7 @@ var All = map[string]func(*testing.T, string){
 	"ParallelFileOpen":           ParallelFileOpen,
 	"Link":                       Link,
 	"LinkUnlinkRename":           LinkUnlinkRename,
+	"LseekHoleSeeksToEOF":        LseekHoleSeeksToEOF,
 	"RenameOverwriteDestNoExist": RenameOverwriteDestNoExist,
 	"RenameOverwriteDestExist":   RenameOverwriteDestExist,
 	"RenameOpenDir":              RenameOpenDir,
@@ -41,6 +43,8 @@ var All = map[string]func(*testing.T, string){
 	"OpenAt":                     OpenAt,
 	"Fallocate":                  Fallocate,
 	"DirSeek":                    DirSeek,
+	"FcntlFlockSetLk":            FcntlFlockSetLk,
+	"FcntlFlockLocksFile":        FcntlFlockLocksFile,
 }
 
 func DirectIO(t *testing.T, mnt string) {
@@ -629,5 +633,90 @@ func Fallocate(t *testing.T, mnt string) {
 	if fi.Size() < (1024 + 4096) {
 		t.Fatalf("fallocate should have changed file size. Got %d bytes",
 			fi.Size())
+	}
+}
+
+func FcntlFlockSetLk(t *testing.T, mnt string) {
+	for i, cmd := range []int{syscall.F_SETLK, syscall.F_SETLKW} {
+		filename := mnt + fmt.Sprintf("/file%d", i)
+		f1, err := os.Create(filename)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer f1.Close()
+		wlk := syscall.Flock_t{
+			Type:  syscall.F_WRLCK,
+			Start: 0,
+			Len:   0,
+		}
+		if err := syscall.FcntlFlock(f1.Fd(), cmd, &wlk); err != nil {
+			t.Fatalf("FcntlFlock failed: %v", err)
+		}
+
+		f2, err := os.OpenFile(filename, os.O_RDWR, 0766)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer f2.Close()
+		lk := syscall.Flock_t{}
+		if err := syscall.FcntlFlock(f2.Fd(), unix.F_OFD_GETLK, &lk); err != nil {
+			t.Errorf("FcntlFlock failed: %v", err)
+		}
+		if lk.Type != syscall.F_WRLCK {
+			t.Errorf("got lk.Type=%v, want %v", lk.Type, syscall.F_WRLCK)
+
+		}
+	}
+}
+
+func FcntlFlockLocksFile(t *testing.T, mnt string) {
+	filename := mnt + "/test"
+	f1, err := os.Create(filename)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f1.Close()
+	wlk := syscall.Flock_t{
+		Type:  syscall.F_WRLCK,
+		Start: 0,
+		Len:   0,
+	}
+	if err := syscall.FcntlFlock(f1.Fd(), syscall.F_SETLK, &wlk); err != nil {
+		t.Fatalf("FcntlFlock failed: %v", err)
+	}
+
+	f2, err := os.OpenFile(filename, os.O_RDWR, 0766)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer f2.Close()
+	rlk := syscall.Flock_t{
+		Type:  syscall.F_RDLCK,
+		Start: 0,
+		Len:   0,
+	}
+	if err := syscall.FcntlFlock(f2.Fd(), syscall.F_SETLK, &rlk); err != syscall.EAGAIN {
+		t.Errorf("FcntlFlock returned %v, expected EAGAIN", err)
+	}
+}
+
+func LseekHoleSeeksToEOF(t *testing.T, mnt string) {
+	fn := filepath.Join(mnt, "file.bin")
+	content := bytes.Repeat([]byte("abcxyz\n"), 1024)
+	if err := ioutil.WriteFile(fn, content, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	fd, err := syscall.Open(fn, syscall.O_RDONLY, 0644)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer syscall.Close(fd)
+
+	off, err := unix.Seek(fd, int64(len(content)/2), unix.SEEK_HOLE)
+	if err != nil {
+		t.Fatalf("Seek: %v", err)
+	} else if off != int64(len(content)) {
+		t.Errorf("got offset %d, want %d", off, len(content))
 	}
 }

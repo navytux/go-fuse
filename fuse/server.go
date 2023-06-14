@@ -21,12 +21,15 @@ import (
 )
 
 const (
-	// The kernel caps writes at 128k.
-	MAX_KERNEL_WRITE = 128 * 1024
+	// Linux v4.20+ caps requests at 1 MiB. Older kernels at 128 kiB.
+	MAX_KERNEL_WRITE = 1024 * 1024
 
 	// Linux kernel constant from include/uapi/linux/fuse.h
 	// Reads from /dev/fuse that are smaller fail with EINVAL.
 	_FUSE_MIN_READ_BUFFER = 8192
+
+	// defaultMaxWrite is the default value for MountOptions.MaxWrite
+	defaultMaxWrite = 128 * 1024 // 128 kiB
 
 	minMaxReaders = 2
 	maxMaxReaders = 16
@@ -113,14 +116,14 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 
 // Unmount calls fusermount -u on the mount. This has the effect of
 // shutting down the filesystem. After the Server is unmounted, it
-// should be discarded.
+// should be discarded.  This function is idempotent.
 //
 // Does not work when we were mounted with the magic /dev/fd/N mountpoint syntax,
 // as we do not know the real mountpoint. Unmount using
 //
-//   fusermount -u /path/to/real/mountpoint
+//	fusermount -u /path/to/real/mountpoint
 //
-/// in this case.
+// in this case.
 func (ms *Server) Unmount() (err error) {
 	if ms.mountPoint == "" {
 		return nil
@@ -167,11 +170,12 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		o.MaxWrite = 0
 	}
 	if o.MaxWrite == 0 {
-		o.MaxWrite = 1 << 16
+		o.MaxWrite = defaultMaxWrite
 	}
 	if o.MaxWrite > MAX_KERNEL_WRITE {
 		o.MaxWrite = MAX_KERNEL_WRITE
 	}
+
 	if o.Name == "" {
 		name := fs.String()
 		l := len(name)
@@ -179,12 +183,6 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			l = _MAX_NAME_LEN
 		}
 		o.Name = strings.Replace(name[:l], ",", ";", -1)
-	}
-
-	for _, s := range o.optionsStrings() {
-		if strings.Contains(s, ",") {
-			return nil, fmt.Errorf("found ',' in option string %q", s)
-		}
 	}
 
 	maxReaders := runtime.GOMAXPROCS(0)
@@ -247,6 +245,10 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	return ms, nil
 }
 
+func escape(optionValue string) string {
+	return strings.Replace(strings.Replace(optionValue, `\`, `\\`, -1), `,`, `\,`, -1)
+}
+
 func (o *MountOptions) optionsStrings() []string {
 	var r []string
 	r = append(r, o.Options...)
@@ -254,13 +256,13 @@ func (o *MountOptions) optionsStrings() []string {
 	if o.AllowOther {
 		r = append(r, "allow_other")
 	}
-
 	if o.FsName != "" {
 		r = append(r, "fsname="+o.FsName)
 	}
 	if o.Name != "" {
 		r = append(r, "subtype="+o.Name)
 	}
+	r = append(r, fmt.Sprintf("max_read=%d", o.MaxWrite))
 
 	// OSXFUSE applies a 60-second timeout for file operations. This
 	// is inconsistent with how FUSE works on Linux, where operations
@@ -269,7 +271,15 @@ func (o *MountOptions) optionsStrings() []string {
 		r = append(r, "daemon_timeout=0")
 	}
 
-	return r
+	// Commas and backslashs in an option need to be escaped, because
+	// options are separated by a comma and backslashs are used to
+	// escape other characters.
+	var rEscaped []string
+	for _, s := range r {
+		rEscaped = append(rEscaped, escape(s))
+	}
+
+	return rEscaped
 }
 
 // DebugData returns internal status information for debugging

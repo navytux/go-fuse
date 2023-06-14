@@ -3,8 +3,11 @@ package fuse
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
 	"syscall"
 	"testing"
+
+	"github.com/moby/sys/mountinfo"
 )
 
 // TestMountDevFd tests the special `/dev/fd/N` mountpoint syntax, where a
@@ -96,5 +99,122 @@ func TestMountMaxWrite(t *testing.T) {
 				srv.Unmount()
 			}
 		})
+	}
+}
+
+// mountCheckOptions mounts a defaultRawFileSystem and extracts the resulting effective
+// mount options from /proc/self/mounts.
+// The mount options are a comma-separated string like this:
+// rw,nosuid,nodev,relatime,user_id=1026,group_id=1026
+func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
+	mnt, err := ioutil.TempDir("", t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDefaultRawFileSystem()
+	srv, err := NewServer(fs, mnt, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Check mount options
+	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(mnt))
+	if err != nil {
+		t.Error(err)
+	}
+	if len(mounts) != 1 {
+		t.Errorf("Could not find mountpoint %q in /proc/self/mountinfo", mnt)
+	}
+	orig := *mounts[0]
+	if testing.Verbose() {
+		t.Logf("full mountinfo: %#v", orig)
+	}
+	// We are only interested in some fields, as the others are arbitrary id numbers
+	// or contain random strings like "/tmp/TestDirectMount1126361240".
+	//
+	// What are all those fields: Look for "/proc/[pid]/mountinfo" in
+	// https://man7.org/linux/man-pages/man5/proc.5.html .
+	info = mountinfo.Info{
+		Options:    orig.Options,
+		Source:     orig.Source,
+		FSType:     orig.FSType,
+		VFSOptions: orig.VFSOptions,
+		Optional:   orig.Optional,
+	}
+	// server needs to run for Unmount to work
+	go srv.Serve()
+	err = srv.Unmount()
+	if err != nil {
+		t.Error(err)
+	}
+	return info
+}
+
+// TestDirectMount checks that DirectMount and DirectMountStrict work and show the
+// same effective mount options in /proc/self/mounts
+func TestDirectMount(t *testing.T) {
+	optsTable := []MountOptions{
+		{Debug: true},
+		{Debug: true, AllowOther: true},
+		{Debug: true, MaxWrite: 9999},
+		{Debug: true, FsName: "aaa"},
+		{Debug: true, Name: "bbb"},
+		{Debug: true, FsName: "ccc", Name: "ddd"},
+		{Debug: true, FsName: "a,b"},
+		{Debug: true, FsName: `a\b`},
+		{Debug: true, FsName: `a\,b`},
+	}
+	for _, opts := range optsTable {
+		// Without DirectMount - i.e. using fusermount
+		o1 := mountCheckOptions(t, opts)
+		// With DirectMount
+		opts.DirectMount = true
+		o2 := mountCheckOptions(t, opts)
+		if o2 != o1 {
+			t.Errorf(`DirectMount effective mount options mismatch:
+DirectMount: %#v
+fusermount:  %#v`, o2, o1)
+
+			// When this already fails then DirectMountStrict will fail the same way.
+			// Skip it for less noise in the logs.
+			continue
+		}
+		if os.Geteuid() == 0 {
+			// With DirectMountStrict
+			opts.DirectMountStrict = true
+			o3 := mountCheckOptions(t, opts)
+			if o3 != o1 {
+				t.Errorf(`DirectMountStrict effective mount options mismatch:
+DirectMountStrict: %#v
+fusermount:        %#v`, o3, o1)
+			}
+		}
+	}
+}
+
+// TestEscapedMountOption tests that fusermount doesn't exit when when using commas or backslashs in options.
+// It also tests that commas or backslashs in options are correctly propagated to /proc/mounts.
+func TestEscapedMountOption(t *testing.T) {
+	fsname := `fsname,with\,many,comm\as,and\backsl\\ashs`
+	opts := &MountOptions{
+		FsName: fsname,
+	}
+	mnt := t.TempDir()
+	fs := NewDefaultRawFileSystem()
+	srv, err := NewServer(fs, mnt, opts)
+	if err != nil {
+		t.Error(err)
+	}
+	go srv.Serve()
+	defer srv.Unmount()
+	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(mnt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("Could not find mountpoint %q in /proc/self/mountinfo", mnt)
+	}
+	m := *mounts[0]
+	if m.Source != fsname {
+		t.Errorf("mountinfo(%q): got %q want %q", mnt, m.Source, fsname)
 	}
 }

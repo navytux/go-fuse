@@ -2,20 +2,23 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux
 // +build linux
 
 package pathfs
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
 )
 
 func TestSysUtimensat(t *testing.T) {
-	symlink := "/tmp/TestSysUtimensat"
-	os.Remove(symlink)
+	dir := t.TempDir()
+
+	symlink := filepath.Join(dir, "symlink")
 	err := os.Symlink("/nonexisting/file", symlink)
 	if err != nil {
 		t.Fatal(err)

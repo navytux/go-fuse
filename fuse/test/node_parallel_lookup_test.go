@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"os"
 	"testing"
 
 	"golang.org/x/sync/errgroup"
@@ -45,7 +44,6 @@ func (r *tRoot) Lookup(out *fuse.Attr, name string, fctx *fuse.Context) (*nodefs
 	return node.Inode(), st
 }
 
-
 // verifyFileRead verifies that file @path has content == dataOK.
 func verifyFileRead(path string, dataOK string) error {
 	v, err := ioutil.ReadFile(path)
@@ -59,13 +57,7 @@ func verifyFileRead(path string, dataOK string) error {
 }
 
 func TestNodeParallelLookup(t *testing.T) {
-	dir := testutil.TempDir()
-	defer func() {
-		err := os.Remove(dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	dir := t.TempDir()
 
 	root := &tRoot{
 		Node:     nodefs.NewDefaultNode(),
@@ -99,7 +91,7 @@ func TestNodeParallelLookup(t *testing.T) {
 	}()
 
 	// the test will deadlock if the client cannot issue several lookups simultaneously
-	if srv.KernelSettings().Flags & fuse.CAP_PARALLEL_DIROPS == 0 {
+	if srv.KernelSettings().Flags&fuse.CAP_PARALLEL_DIROPS == 0 {
 		t.Skip("Kernel serializes dir lookups")
 	}
 
@@ -110,10 +102,10 @@ func TestNodeParallelLookup(t *testing.T) {
 	defer cancel()
 	wg, ctx := errgroup.WithContext(ctx0)
 	wg.Go(func() error {
-		return verifyFileRead(dir + "/hello", "abc")
+		return verifyFileRead(dir+"/hello", "abc")
 	})
 	wg.Go(func() error {
-		return verifyFileRead(dir + "/world", "def")
+		return verifyFileRead(dir+"/world", "def")
 	})
 
 	// wait till both threads queue into Lookup

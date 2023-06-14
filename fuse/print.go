@@ -77,6 +77,9 @@ var (
 		W_OK: "w",
 		R_OK: "r",
 	}
+	getAttrFlagNames = map[int64]string{
+		FUSE_GETATTR_FH: "FH",
+	}
 )
 
 func flagString(names map[int64]string, fl int64, def string) string {
@@ -209,7 +212,7 @@ func (o *AttrOut) string() string {
 
 // ft converts (seconds , nanoseconds) -> float(seconds)
 func ft(tsec uint64, tnsec uint32) float64 {
-	return float64(tsec) + float64(tnsec)*1E-9
+	return float64(tsec) + float64(tnsec)*1e-9
 }
 
 // Returned by LOOKUP

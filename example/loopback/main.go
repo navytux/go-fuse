@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 func writeMemProfile(fn string, sigs <-chan os.Signal) {
@@ -47,6 +48,8 @@ func main() {
 	other := flag.Bool("allow-other", false, "mount with -o allowother.")
 	quiet := flag.Bool("q", false, "quiet")
 	ro := flag.Bool("ro", false, "mount read-only")
+	directmount := flag.Bool("directmount", false, "try to call the mount syscall instead of executing fusermount")
+	directmountstrict := flag.Bool("directmountstrict", false, "like directmount, but don't fall back to fusermount")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to this file")
 	memprofile := flag.String("memprofile", "", "write memory profile to this file")
 	flag.Parse()
@@ -90,13 +93,22 @@ func main() {
 
 	sec := time.Second
 	opts := &fs.Options{
-		// These options are to be compatible with libfuse defaults,
+		// The timeout options are to be compatible with libfuse defaults,
 		// making benchmarking easier.
 		AttrTimeout:  &sec,
 		EntryTimeout: &sec,
+
+		NullPermissions: true, // Leave file permissions on "000" files as-is
+
+		MountOptions: fuse.MountOptions{
+			AllowOther:        *other,
+			Debug:             *debug,
+			DirectMount:       *directmount,
+			DirectMountStrict: *directmountstrict,
+			FsName:            orig,       // First column in "df -T": original dir
+			Name:              "loopback", // Second column in "df -T" will be shown as "fuse." + Name
+		},
 	}
-	opts.Debug = *debug
-	opts.AllowOther = *other
 	if opts.AllowOther {
 		// Make the kernel check file permissions for us
 		opts.MountOptions.Options = append(opts.MountOptions.Options, "default_permissions")
@@ -104,12 +116,6 @@ func main() {
 	if *ro {
 		opts.MountOptions.Options = append(opts.MountOptions.Options, "ro")
 	}
-	// First column in "df -T": original dir
-	opts.MountOptions.Options = append(opts.MountOptions.Options, "fsname="+orig)
-	// Second column in "df -T" will be shown as "fuse." + Name
-	opts.MountOptions.Name = "loopback"
-	// Leave file permissions on "000" files as-is
-	opts.NullPermissions = true
 	// Enable diagnostics logging
 	if !*quiet {
 		opts.Logger = log.New(os.Stderr, "", 0)
@@ -121,5 +127,13 @@ func main() {
 	if !*quiet {
 		fmt.Println("Mounted!")
 	}
+
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		server.Unmount()
+	}()
+
 	server.Wait()
 }
