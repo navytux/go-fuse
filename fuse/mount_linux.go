@@ -7,13 +7,11 @@ package fuse
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
 func unixgramSocketpair() (l, r *os.File, err error) {
@@ -69,7 +67,7 @@ func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd 
 	}
 
 	if opts.Debug {
-		log.Printf("mountDirect: calling syscall.Mount(%q, %q, %q, %#x, %q)",
+		opts.Logger.Printf("mountDirect: calling syscall.Mount(%q, %q, %q, %#x, %q)",
 			source, mountPoint, "fuse."+opts.Name, flags, strings.Join(r, ","))
 	}
 	err = syscall.Mount(source, mountPoint, "fuse."+opts.Name, flags, strings.Join(r, ","))
@@ -108,7 +106,7 @@ func callFusermount(mountPoint string, opts *MountOptions) (fd int, err error) {
 		cmd = append(cmd, "-o", strings.Join(s, ","))
 	}
 	if opts.Debug {
-		log.Printf("callFusermount: executing %q", cmd)
+		opts.Logger.Printf("callFusermount: executing %q", cmd)
 	}
 	proc, err := os.StartProcess(bin,
 		cmd,
@@ -145,7 +143,7 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 		if err == nil {
 			return fd, nil
 		} else if opts.Debug {
-			log.Printf("mount: failed to do direct mount: %s", err)
+			opts.Logger.Printf("mount: failed to do direct mount: %s", err)
 		}
 		if opts.DirectMountStrict {
 			return -1, err
@@ -157,7 +155,7 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 	fd = parseFuseFd(mountPoint)
 	if fd >= 0 {
 		if opts.Debug {
-			log.Printf("mount: magic mountpoint %q, using fd %d", mountPoint, fd)
+			opts.Logger.Printf("mount: magic mountpoint %q, using fd %d", mountPoint, fd)
 		}
 	} else {
 		// Usual case: mount via the `fusermount` suid helper
@@ -194,7 +192,7 @@ func unmount(mountPoint string, opts *MountOptions) (err error) {
 	cmd := exec.Command(bin, "-u", mountPoint)
 	cmd.Stderr = &errBuf
 	if opts.Debug {
-		log.Printf("unmount: executing %q", cmd.Args)
+		opts.Logger.Printf("unmount: executing %q", cmd.Args)
 	}
 	err = cmd.Run()
 	if errBuf.Len() > 0 {
@@ -202,33 +200,6 @@ func unmount(mountPoint string, opts *MountOptions) (err error) {
 			errBuf.String(), err)
 	}
 	return err
-}
-
-func getConnection(local *os.File) (int, error) {
-	var data [4]byte
-	control := make([]byte, 4*256)
-
-	// n, oobn, recvflags, from, errno  - todo: error checking.
-	_, oobn, _, _,
-		err := syscall.Recvmsg(
-		int(local.Fd()), data[:], control[:], 0)
-	if err != nil {
-		return 0, err
-	}
-
-	message := *(*syscall.Cmsghdr)(unsafe.Pointer(&control[0]))
-	fd := *(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(&control[0])) + syscall.SizeofCmsghdr))
-
-	if message.Type != 1 {
-		return 0, fmt.Errorf("getConnection: recvmsg returned wrong control type: %d", message.Type)
-	}
-	if oobn <= syscall.SizeofCmsghdr {
-		return 0, fmt.Errorf("getConnection: too short control message. Length: %d", oobn)
-	}
-	if fd < 0 {
-		return 0, fmt.Errorf("getConnection: fd < 0: %d", fd)
-	}
-	return int(fd), nil
 }
 
 // lookPathFallback - search binary in PATH and, if that fails,
