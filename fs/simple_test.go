@@ -25,6 +25,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/internal/testutil"
 	"github.com/hanwen/go-fuse/v2/posixtest"
+	"golang.org/x/sys/unix"
 )
 
 type testCase struct {
@@ -339,7 +340,7 @@ func TestMknod(t *testing.T) {
 			var st syscall.Stat_t
 			if err := syscall.Stat(p, &st); err != nil {
 				got := st.Mode &^ 07777
-				if want := mode; got != want {
+				if want := uint(mode); want != uint(got) {
 					t.Fatalf("stat(%s): got %o want %o", nm, got, want)
 				}
 			}
@@ -646,28 +647,38 @@ func TestStaleHardlinks(t *testing.T) {
 	// Disable all caches we can disable
 	tc := newTestCase(t, &testOptions{attrCache: false, entryCache: false})
 
+	// gvfsd-trash sets an inotify watch on mntDir and stat()s every file that is
+	// created, racing with the test logic ( https://github.com/hanwen/go-fuse/issues/478 ).
+	// Use a subdir to prevent that.
+	if err := os.Mkdir(tc.mntDir+"/x", 0755); err != nil {
+		t.Fatal(err)
+	}
+
 	// "link0" is original file
-	link0 := tc.mntDir + "/link0"
-	if fd, err := syscall.Creat(link0, 0600); err != nil {
+	link0 := tc.mntDir + "/x/link0"
+	if fd, err := unix.Open(link0, unix.O_CREAT, 0600); err != nil {
 		t.Fatal(err)
 	} else {
 		syscall.Close(fd)
 	}
 	// Create hardlinks via mntDir
+	t.Logf("create link1...20, pid=%d", os.Getpid())
 	for i := 1; i < 20; i++ {
-		linki := fmt.Sprintf(tc.mntDir+"/link%d", i)
+		linki := fmt.Sprintf(tc.mntDir+"/x/link%d", i)
 		if err := syscall.Link(link0, linki); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Delete hardlinks via origDir (behind loopback fs's back)
+	t.Log("delete link1...20 behind loopback's back")
 	for i := 1; i < 20; i++ {
-		linki := fmt.Sprintf(tc.origDir+"/link%d", i)
+		linki := fmt.Sprintf(tc.origDir+"/x/link%d", i)
 		if err := syscall.Unlink(linki); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Try to open link0 via mntDir
+	t.Log("open link0")
 	fd, err := syscall.Open(link0, syscall.O_RDONLY, 0)
 	if err != nil {
 		t.Error(err)
@@ -679,4 +690,48 @@ func TestStaleHardlinks(t *testing.T) {
 
 func init() {
 	syscall.Umask(0)
+}
+
+func testMountDir(dir string) error {
+	opts := &Options{}
+	opts.Debug = testutil.VerboseTest()
+	server, err := Mount(dir, &Inode{}, opts)
+	if err != nil {
+		return err
+	}
+
+	server.Unmount()
+	server.Wait()
+	return nil
+}
+
+func TestParallelMount(t *testing.T) {
+	before := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(before)
+	// Per default, only 1000 FUSE mounts are allowed, then you get
+	// > /usr/bin/fusermount3: too many FUSE filesystems mounted; mount_max=N can be set in /etc/fuse.conf
+	// Let's stay well below 1000.
+	N := 900
+	todo := make(chan string, N)
+	result := make(chan error, N)
+	for i := 0; i < N; i++ {
+		todo <- t.TempDir()
+	}
+	close(todo)
+
+	P := 2
+	for i := 0; i < P; i++ {
+		go func() {
+			for d := range todo {
+				result <- testMountDir(d)
+			}
+		}()
+	}
+
+	for i := 0; i < N; i++ {
+		e := <-result
+		if e != nil {
+			t.Error(e)
+		}
+	}
 }

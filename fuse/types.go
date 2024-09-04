@@ -44,9 +44,6 @@ const (
 	// ENOSYS Function not implemented
 	ENOSYS = Status(syscall.ENOSYS)
 
-	// ENODATA No data available
-	ENODATA = Status(syscall.ENODATA)
-
 	// ENOTDIR Not a directory
 	ENOTDIR = Status(syscall.ENOTDIR)
 
@@ -259,12 +256,13 @@ const (
 	FOPEN_STREAM                 = (1 << 4)
 	FOPEN_NOFLUSH                = (1 << 5)
 	FOPEN_PARALLEL_DIRECT_WRITES = (1 << 6)
+	FOPEN_PASSTHROUGH            = (1 << 7)
 )
 
 type OpenOut struct {
 	Fh        uint64
 	OpenFlags uint32
-	Padding   uint32
+	BackingID int32
 }
 
 // To be set in InitIn/InitOut.Flags.
@@ -301,12 +299,16 @@ const (
 	CAP_MAX_PAGES        = (1 << 22)
 	CAP_CACHE_SYMLINKS   = (1 << 23)
 
+	/* bits 24..31 differ across linux and mac */
 	/* bits 32..63 get shifted down 32 bits into the Flags2 field */
-	CAP_SECURITY_CTX      = (1 << 32)
-	CAP_HAS_INODE_DAX     = (1 << 33)
-	CAP_CREATE_SUPP_GROUP = (1 << 34)
-	CAP_HAS_EXPIRE_ONLY   = (1 << 35)
-	CAP_DIRECT_IO_RELAX   = (1 << 36)
+	CAP_SECURITY_CTX         = (1 << 32)
+	CAP_HAS_INODE_DAX        = (1 << 33)
+	CAP_CREATE_SUPP_GROUP    = (1 << 34)
+	CAP_HAS_EXPIRE_ONLY      = (1 << 35)
+	CAP_DIRECT_IO_ALLOW_MMAP = (1 << 36)
+	CAP_PASSTHROUGH          = (1 << 37)
+	CAP_NO_EXPORT_SUPPORT    = (1 << 38)
+	CAP_HAS_RESEND           = (1 << 39)
 )
 
 type InitIn struct {
@@ -318,6 +320,10 @@ type InitIn struct {
 	Flags        uint32
 	Flags2       uint32
 	Unused       [11]uint32
+}
+
+func (i *InitIn) Flags64() uint64 {
+	return uint64(i.Flags) | uint64(i.Flags2)<<32
 }
 
 type InitOut struct {
@@ -332,7 +338,12 @@ type InitOut struct {
 	MaxPages            uint16
 	Padding             uint16
 	Flags2              uint32
-	Unused              [7]uint32
+	MaxStackDepth       uint32
+	Unused              [6]uint32
+}
+
+func (o *InitOut) Flags64() uint64 {
+	return uint64(o.Flags) | uint64(o.Flags2)<<32
 }
 
 type _CuseInitIn struct {
@@ -519,6 +530,7 @@ const (
 	NOTIFY_STORE_CACHE    = -4 // store data into kernel cache of an inode
 	NOTIFY_RETRIEVE_CACHE = -5 // retrieve data from kernel cache of an inode
 	NOTIFY_DELETE         = -6 // notify kernel that a directory entry has been deleted
+	NOTIFY_RESEND         = -7
 
 // NOTIFY_CODE_MAX     = -6
 )
@@ -692,4 +704,80 @@ func (lk *FileLock) FromFlockT(flockT *syscall.Flock_t) {
 		}
 	}
 	lk.Pid = uint32(flockT.Pid)
+}
+
+const (
+	// Mask for GetAttrIn.Flags. If set, GetAttrIn has a file handle set.
+	FUSE_GETATTR_FH = (1 << 0)
+)
+
+type GetAttrIn struct {
+	InHeader
+
+	Flags_ uint32
+	Dummy  uint32
+	Fh_    uint64
+}
+
+// Flags accesses the flags. This is a method, because OSXFuse does not
+// have GetAttrIn flags.
+func (g *GetAttrIn) Flags() uint32 {
+	return g.Flags_
+}
+
+// Fh accesses the file handle. This is a method, because OSXFuse does not
+// have GetAttrIn flags.
+func (g *GetAttrIn) Fh() uint64 {
+	return g.Fh_
+}
+
+type MknodIn struct {
+	InHeader
+
+	// Mode to use, including the Umask value
+	Mode    uint32
+	Rdev    uint32
+	Umask   uint32
+	Padding uint32
+}
+
+type CreateIn struct {
+	InHeader
+	Flags uint32
+
+	// Mode for the new file; already takes Umask into account.
+	Mode uint32
+
+	// Umask used for this create call.
+	Umask   uint32
+	Padding uint32
+}
+
+type ReadIn struct {
+	InHeader
+	Fh        uint64
+	Offset    uint64
+	Size      uint32
+	ReadFlags uint32
+	LockOwner uint64
+	Flags     uint32
+	Padding   uint32
+}
+
+type WriteIn struct {
+	InHeader
+	Fh         uint64
+	Offset     uint64
+	Size       uint32
+	WriteFlags uint32
+	LockOwner  uint64
+	Flags      uint32
+	Padding    uint32
+}
+
+// Data for registering a file as backing an inode.
+type BackingMap struct {
+	Fd      int32
+	Flags   uint32
+	padding uint64
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/internal/renameat"
+	"golang.org/x/sys/unix"
 )
 
 // LoopbackRoot holds the parameters for creating a new loopback
@@ -123,7 +124,7 @@ var _ = (NodeMknoder)((*LoopbackNode)(nil))
 
 func (n *LoopbackNode) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*Inode, syscall.Errno) {
 	p := filepath.Join(n.path(), name)
-	err := syscall.Mknod(p, mode, int(rdev))
+	err := syscall.Mknod(p, mode, intDev(rdev))
 	if err != nil {
 		return nil, ToErrno(err)
 	}
@@ -402,20 +403,23 @@ func (n *LoopbackNode) Setattr(ctx context.Context, f FileHandle, in *fuse.SetAt
 		atime, aok := in.GetATime()
 
 		if mok || aok {
-
-			ap := &atime
-			mp := &mtime
-			if !aok {
-				ap = nil
+			ta := unix.Timespec{Nsec: unix_UTIME_OMIT}
+			tm := unix.Timespec{Nsec: unix_UTIME_OMIT}
+			var err error
+			if aok {
+				ta, err = unix.TimeToTimespec(atime)
+				if err != nil {
+					return ToErrno(err)
+				}
 			}
-			if !mok {
-				mp = nil
+			if mok {
+				tm, err = unix.TimeToTimespec(mtime)
+				if err != nil {
+					return ToErrno(err)
+				}
 			}
-			var ts [2]syscall.Timespec
-			ts[0] = fuse.UtimeToTimespec(ap)
-			ts[1] = fuse.UtimeToTimespec(mp)
-
-			if err := syscall.UtimesNano(p, ts[:]); err != nil {
+			ts := []unix.Timespec{ta, tm}
+			if err := unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 				return ToErrno(err)
 			}
 		}
@@ -439,6 +443,46 @@ func (n *LoopbackNode) Setattr(ctx context.Context, f FileHandle, in *fuse.SetAt
 		out.FromStat(&st)
 	}
 	return OK
+}
+
+var _ = (NodeGetxattrer)((*LoopbackNode)(nil))
+
+func (n *LoopbackNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	sz, err := unix.Lgetxattr(n.path(), attr, dest)
+	return uint32(sz), ToErrno(err)
+}
+
+var _ = (NodeSetxattrer)((*LoopbackNode)(nil))
+
+func (n *LoopbackNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	err := unix.Lsetxattr(n.path(), attr, data, int(flags))
+	return ToErrno(err)
+}
+
+var _ = (NodeRemovexattrer)((*LoopbackNode)(nil))
+
+func (n *LoopbackNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	err := unix.Lremovexattr(n.path(), attr)
+	return ToErrno(err)
+}
+
+var _ = (NodeCopyFileRanger)((*LoopbackNode)(nil))
+
+func (n *LoopbackNode) CopyFileRange(ctx context.Context, fhIn FileHandle,
+	offIn uint64, out *Inode, fhOut FileHandle, offOut uint64,
+	len uint64, flags uint64) (uint32, syscall.Errno) {
+	lfIn, ok := fhIn.(*loopbackFile)
+	if !ok {
+		return 0, unix.ENOTSUP
+	}
+	lfOut, ok := fhOut.(*loopbackFile)
+	if !ok {
+		return 0, unix.ENOTSUP
+	}
+	signedOffIn := int64(offIn)
+	signedOffOut := int64(offOut)
+	doCopyFileRange(lfIn.fd, signedOffIn, lfOut.fd, signedOffOut, int(len), int(flags))
+	return 0, syscall.ENOSYS
 }
 
 // NewLoopbackRoot returns a root node for a loopback file system whose

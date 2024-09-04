@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/hanwen/go-fuse/v2/internal/fallocate"
 	"golang.org/x/sys/unix"
 )
 
@@ -47,6 +48,32 @@ var All = map[string]func(*testing.T, string){
 	"DirSeek":                    DirSeek,
 	"FcntlFlockSetLk":            FcntlFlockSetLk,
 	"FcntlFlockLocksFile":        FcntlFlockLocksFile,
+	"SetattrSymlink":             SetattrSymlink,
+}
+
+func SetattrSymlink(t *testing.T, mnt string) {
+	l := filepath.Join(mnt, "link")
+	if err := os.Symlink("doesnotexist", l); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	tvs := []unix.Timeval{
+		{Sec: 42, Usec: 1},
+		{Sec: 43, Usec: 2},
+	}
+	if err := unix.Lutimes(l, tvs); err != nil {
+		t.Fatalf("Lutimes: %v", err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Lstat(l, &st); err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+
+	if st.Mtim.Sec != 43 {
+		// Can't check atime; it's hard to prevent implicit readlink calls.
+		t.Fatalf("got mtime %v, want 43", st.Mtim)
+	}
 }
 
 func DirectIO(t *testing.T, mnt string) {
@@ -272,7 +299,7 @@ func FstatDeleted(t *testing.T, mnt string) {
 	const iMax = 9
 	type file struct {
 		fd int
-		st syscall.Stat_t
+		st unix.Stat_t
 	}
 	files := make(map[int]file)
 	for i := 0; i <= iMax; i++ {
@@ -283,8 +310,8 @@ func FstatDeleted(t *testing.T, mnt string) {
 		if err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
-		var st syscall.Stat_t
-		err = syscall.Stat(path, &st)
+		var st unix.Stat_t
+		err = unix.Stat(path, &st)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -303,14 +330,14 @@ func FstatDeleted(t *testing.T, mnt string) {
 	}
 	// Fstat in random order
 	for _, v := range files {
-		var st syscall.Stat_t
-		err := syscall.Fstat(v.fd, &st)
+		var st unix.Stat_t
+		err := unix.Fstat(v.fd, &st)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Ignore ctime, changes on unlink
-		v.st.Ctim = syscall.Timespec{}
-		st.Ctim = syscall.Timespec{}
+		v.st.Ctim = unix.Timespec{}
+		st.Ctim = unix.Timespec{}
 		// Nlink value should have dropped to zero
 		v.st.Nlink = 0
 		// Rest should stay the same
@@ -607,7 +634,7 @@ func OpenAt(t *testing.T, mnt string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fd, err := syscall.Openat(dirfd, "file1", syscall.O_CREAT, 0700)
+	fd, err := unix.Openat(dirfd, "file1", syscall.O_CREAT, 0700)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +651,7 @@ func Fallocate(t *testing.T, mnt string) {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
 	defer rwFile.Close()
-	err = syscall.Fallocate(int(rwFile.Fd()), 0, 1024, 4096)
+	err = fallocate.Fallocate(int(rwFile.Fd()), 0, 1024, 4096)
 	if err != nil {
 		t.Fatalf("Fallocate failed: %v", err)
 	}
@@ -661,12 +688,11 @@ func FcntlFlockSetLk(t *testing.T, mnt string) {
 		}
 		defer f2.Close()
 		lk := syscall.Flock_t{}
-		if err := syscall.FcntlFlock(f2.Fd(), unix.F_OFD_GETLK, &lk); err != nil {
+		if err := sysFcntlFlockGetOFDLock(f2.Fd(), &lk); err != nil {
 			t.Errorf("FcntlFlock failed: %v", err)
 		}
 		if lk.Type != syscall.F_WRLCK {
 			t.Errorf("got lk.Type=%v, want %v", lk.Type, syscall.F_WRLCK)
-
 		}
 	}
 }

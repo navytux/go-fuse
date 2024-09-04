@@ -1,17 +1,20 @@
-// Copyright 2016 the Go-FUSE Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+//go:build !linux
 
 package fuse
 
 import (
-	"syscall"
+	"golang.org/x/sys/unix"
 )
+
+// OSX and FreeBSD has races when multiple routines read
+// from the FUSE device: on unmount, sometime some reads
+// do not error-out, meaning that unmount will hang.
+const useSingleReader = true
 
 func (ms *Server) systemWrite(req *request, header []byte) Status {
 	if req.flatDataSize() == 0 {
 		err := handleEINTR(func() error {
-			_, err := syscall.Write(ms.mountFd, header)
+			_, err := unix.Write(ms.mountFd, header)
 			return err
 		})
 		return ToStatus(err)
